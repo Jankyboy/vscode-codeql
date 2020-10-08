@@ -721,7 +721,7 @@
     "through2": "^3.0.1",
     "ts-loader": "^5.4.5",
     "ts-node": "^8.3.0",
-    "ts-protoc-gen": "^0.9.0",
+    "ts-protoc-gen": "^0.13.0",
     "typescript": "~3.8.3",
     "typescript-formatter": "^7.2.2",
     "vsce": "^1.65.0",
