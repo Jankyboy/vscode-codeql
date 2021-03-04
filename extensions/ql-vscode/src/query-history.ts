@@ -1,12 +1,20 @@
 import * as path from 'path';
 import * as vscode from 'vscode';
-import { ExtensionContext, window as Window } from 'vscode';
+import { window as Window } from 'vscode';
 import { CompletedQuery } from './query-results';
 import { QueryHistoryConfig } from './config';
 import { QueryWithResults } from './run-queries';
-import * as helpers from './helpers';
+import {
+  showAndLogErrorMessage,
+  showAndLogInformationMessage,
+  showAndLogWarningMessage,
+  showBinaryChoiceDialog
+} from './helpers';
 import { logger } from './logging';
 import { URLSearchParams } from 'url';
+import { QueryServerClient } from './queryserver-client';
+import { DisposableObject } from './pure/disposable-object';
+import { commandRunner } from './commandRunner';
 
 /**
  * query-history.ts
@@ -53,33 +61,33 @@ const FAILED_QUERY_HISTORY_ITEM_ICON = 'media/red-x.svg';
 /**
  * Tree data provider for the query history view.
  */
-class HistoryTreeDataProvider
-  implements vscode.TreeDataProvider<CompletedQuery> {
-  /**
-   * XXX: This idiom for how to get a `.fire()`-able event emitter was
-   * cargo culted from another vscode extension. It seems rather
-   * involved and I hope there's something better that can be done
-   * instead.
-   */
-  private _onDidChangeTreeData: vscode.EventEmitter<
-    CompletedQuery | undefined
-  > = new vscode.EventEmitter<CompletedQuery | undefined>();
+export class HistoryTreeDataProvider extends DisposableObject {
+  private _onDidChangeTreeData = super.push(new vscode.EventEmitter<CompletedQuery | undefined>());
+
   readonly onDidChangeTreeData: vscode.Event<CompletedQuery | undefined> = this
     ._onDidChangeTreeData.event;
 
   private history: CompletedQuery[] = [];
+
+  private failedIconPath: string;
 
   /**
    * When not undefined, must be reference-equal to an item in `this.databases`.
    */
   private current: CompletedQuery | undefined;
 
-  constructor(private ctx: ExtensionContext) { }
+  constructor(extensionPath: string) {
+    super();
+    this.failedIconPath = path.join(
+      extensionPath,
+      FAILED_QUERY_HISTORY_ITEM_ICON
+    );
+  }
 
   async getTreeItem(element: CompletedQuery): Promise<vscode.TreeItem> {
-    const it = new vscode.TreeItem(element.toString());
+    const treeItem = new vscode.TreeItem(element.toString());
 
-    it.command = {
+    treeItem.command = {
       title: 'Query History Item',
       command: 'codeQLQueryHistory.itemClicked',
       arguments: [element],
@@ -88,18 +96,16 @@ class HistoryTreeDataProvider
     // Mark this query history item according to whether it has a
     // SARIF file so that we can make context menu items conditionally
     // available.
-    it.contextValue = (await element.query.hasInterpretedResults())
+    const hasResults = await element.query.hasInterpretedResults();
+    treeItem.contextValue = hasResults
       ? 'interpretedResultsItem'
       : 'rawResultsItem';
 
     if (!element.didRunSuccessfully) {
-      it.iconPath = path.join(
-        this.ctx.extensionPath,
-        FAILED_QUERY_HISTORY_ITEM_ICON
-      );
+      treeItem.iconPath = this.failedIconPath;
     }
 
-    return it;
+    return treeItem;
   }
 
   getChildren(
@@ -116,7 +122,7 @@ class HistoryTreeDataProvider
     return this.current;
   }
 
-  push(item: CompletedQuery): void {
+  pushQuery(item: CompletedQuery): void {
     this.current = item;
     this.history.push(item);
     this.refresh();
@@ -144,8 +150,8 @@ class HistoryTreeDataProvider
     return this.history;
   }
 
-  refresh() {
-    this._onDidChangeTreeData.fire(undefined);
+  refresh(completedQuery?: CompletedQuery) {
+    this._onDidChangeTreeData.fire(completedQuery);
   }
 
   find(queryId: number): CompletedQuery | undefined {
@@ -159,14 +165,16 @@ class HistoryTreeDataProvider
  */
 const DOUBLE_CLICK_TIME = 500;
 
-export class QueryHistoryManager {
+const NO_QUERY_SELECTED = 'No query selected. Select a query history item you have already run and try again.';
+export class QueryHistoryManager extends DisposableObject {
   treeDataProvider: HistoryTreeDataProvider;
   treeView: vscode.TreeView<CompletedQuery>;
   lastItemClick: { time: Date; item: CompletedQuery } | undefined;
   compareWithItem: CompletedQuery | undefined;
 
   constructor(
-    ctx: ExtensionContext,
+    private qs: QueryServerClient,
+    extensionPath: string,
     private queryHistoryConfigListener: QueryHistoryConfig,
     private selectedCallback: (item: CompletedQuery) => Promise<void>,
     private doCompareCallback: (
@@ -174,78 +182,93 @@ export class QueryHistoryManager {
       to: CompletedQuery
     ) => Promise<void>
   ) {
+    super();
+
     const treeDataProvider = (this.treeDataProvider = new HistoryTreeDataProvider(
-      ctx
+      extensionPath
     ));
     this.treeView = Window.createTreeView('codeQLQueryHistory', {
       treeDataProvider,
       canSelectMany: true,
     });
+    this.push(this.treeView);
+    this.push(treeDataProvider);
 
     // Lazily update the tree view selection due to limitations of TreeView API (see
     // `updateTreeViewSelectionIfVisible` doc for details)
-    this.treeView.onDidChangeVisibility(async (_ev) =>
-      this.updateTreeViewSelectionIfVisible()
+    this.push(
+      this.treeView.onDidChangeVisibility(async (_ev) =>
+        this.updateTreeViewSelectionIfVisible()
+      )
     );
     // Don't allow the selection to become empty
-    this.treeView.onDidChangeSelection(async (ev) => {
-      if (ev.selection.length == 0) {
-        this.updateTreeViewSelectionIfVisible();
-      }
-      this.updateCompareWith(ev.selection);
-    });
+    this.push(
+      this.treeView.onDidChangeSelection(async (ev) => {
+        if (ev.selection.length == 0) {
+          this.updateTreeViewSelectionIfVisible();
+        }
+        this.updateCompareWith(ev.selection);
+      })
+    );
+
     logger.log('Registering query history panel commands.');
-    ctx.subscriptions.push(
-      vscode.commands.registerCommand(
+    this.push(
+      commandRunner(
         'codeQLQueryHistory.openQuery',
         this.handleOpenQuery.bind(this)
       )
     );
-    ctx.subscriptions.push(
-      vscode.commands.registerCommand(
+    this.push(
+      commandRunner(
         'codeQLQueryHistory.removeHistoryItem',
         this.handleRemoveHistoryItem.bind(this)
       )
     );
-    ctx.subscriptions.push(
-      vscode.commands.registerCommand(
+    this.push(
+      commandRunner(
         'codeQLQueryHistory.setLabel',
         this.handleSetLabel.bind(this)
       )
     );
-    ctx.subscriptions.push(
-      vscode.commands.registerCommand(
+    this.push(
+      commandRunner(
         'codeQLQueryHistory.compareWith',
         this.handleCompareWith.bind(this)
       )
     );
-    ctx.subscriptions.push(
-      vscode.commands.registerCommand(
+    this.push(
+      commandRunner(
         'codeQLQueryHistory.showQueryLog',
         this.handleShowQueryLog.bind(this)
       )
     );
-    ctx.subscriptions.push(
-      vscode.commands.registerCommand(
+    this.push(
+      commandRunner(
         'codeQLQueryHistory.showQueryText',
         this.handleShowQueryText.bind(this)
       )
     );
-    ctx.subscriptions.push(
-      vscode.commands.registerCommand(
+    this.push(
+      commandRunner(
         'codeQLQueryHistory.viewSarif',
         this.handleViewSarif.bind(this)
       )
     );
-    ctx.subscriptions.push(
-      vscode.commands.registerCommand(
+    this.push(
+      commandRunner(
+        'codeQLQueryHistory.viewDil',
+        this.handleViewDil.bind(this)
+      )
+    );
+    this.push(
+      commandRunner(
         'codeQLQueryHistory.itemClicked',
-        async (item) => {
+        async (item: CompletedQuery) => {
           return this.handleItemClicked(item, [item]);
         }
       )
     );
-    queryHistoryConfigListener.onDidChangeQueryHistoryConfiguration(() => {
+    queryHistoryConfigListener.onDidChangeConfiguration(() => {
       this.treeDataProvider.refresh();
     });
 
@@ -276,19 +299,24 @@ export class QueryHistoryManager {
     singleItem: CompletedQuery,
     multiSelect: CompletedQuery[]
   ): Promise<void> {
-    if (!this.assertSingleQuery(multiSelect)) {
+    const { finalSingleItem, finalMultiSelect } = this.determineSelection(singleItem, multiSelect);
+    if (!this.assertSingleQuery(finalMultiSelect)) {
       return;
     }
 
+    if (!finalSingleItem) {
+      throw new Error(NO_QUERY_SELECTED);
+    }
+
     const textDocument = await vscode.workspace.openTextDocument(
-      vscode.Uri.file(singleItem.query.program.queryPath)
+      vscode.Uri.file(finalSingleItem.query.program.queryPath)
     );
     const editor = await vscode.window.showTextDocument(
       textDocument,
       vscode.ViewColumn.One
     );
-    const queryText = singleItem.options.queryText;
-    if (queryText !== undefined && singleItem.options.isQuickQuery) {
+    const queryText = finalSingleItem.options.queryText;
+    if (queryText !== undefined && finalSingleItem.options.isQuickQuery) {
       await editor.edit((edit) =>
         edit.replace(
           textDocument.validateRange(
@@ -304,7 +332,9 @@ export class QueryHistoryManager {
     singleItem: CompletedQuery,
     multiSelect: CompletedQuery[]
   ) {
-    (multiSelect || [singleItem]).forEach((item) => {
+    const { finalSingleItem, finalMultiSelect } = this.determineSelection(singleItem, multiSelect);
+
+    (finalMultiSelect || [finalSingleItem]).forEach((item) => {
       this.treeDataProvider.remove(item);
       item.dispose();
     });
@@ -330,11 +360,9 @@ export class QueryHistoryManager {
     });
     // undefined response means the user cancelled the dialog; don't change anything
     if (response !== undefined) {
-      if (response === '')
-        // Interpret empty string response as 'go back to using default'
-        singleItem.options.label = undefined;
-      else singleItem.options.label = response;
-      this.treeDataProvider.refresh();
+      // Interpret empty string response as 'go back to using default'
+      singleItem.options.label = response === '' ? undefined : response;
+      this.treeDataProvider.refresh(singleItem);
     }
   }
 
@@ -354,7 +382,7 @@ export class QueryHistoryManager {
         this.doCompareCallback(from, to);
       }
     } catch (e) {
-      helpers.showAndLogErrorMessage(e.message);
+      showAndLogErrorMessage(e.message);
     }
   }
 
@@ -362,14 +390,20 @@ export class QueryHistoryManager {
     singleItem: CompletedQuery,
     multiSelect: CompletedQuery[]
   ) {
-    if (!this.assertSingleQuery(multiSelect)) {
+    const { finalSingleItem, finalMultiSelect } = this.determineSelection(singleItem, multiSelect);
+    if (!this.assertSingleQuery(finalMultiSelect)) {
       return;
     }
-    this.treeDataProvider.setCurrentItem(singleItem);
+
+    if (!finalSingleItem) {
+      throw new Error(NO_QUERY_SELECTED);
+    }
+
+    this.treeDataProvider.setCurrentItem(finalSingleItem);
 
     const now = new Date();
     const prevItemClick = this.lastItemClick;
-    this.lastItemClick = { time: now, item: singleItem };
+    this.lastItemClick = { time: now, item: finalSingleItem };
 
     if (
       prevItemClick !== undefined &&
@@ -395,7 +429,7 @@ export class QueryHistoryManager {
     if (singleItem.logFileLocation) {
       await this.tryOpenExternalFile(singleItem.logFileLocation);
     } else {
-      helpers.showAndLogWarningMessage('No log file available');
+      showAndLogWarningMessage('No log file available');
     }
   }
 
@@ -407,22 +441,22 @@ export class QueryHistoryManager {
       return;
     }
 
-    try {
-      const queryName = singleItem.queryName.endsWith('.ql')
-        ? singleItem.queryName
-        : singleItem.queryName + '.ql';
-      const params = new URLSearchParams({
-        isQuickEval: String(!!singleItem.query.quickEvalPosition),
-        queryText: encodeURIComponent(await this.getQueryText(singleItem)),
-      });
-      const uri = vscode.Uri.parse(
-        `codeql:${singleItem.query.queryID}-${queryName}?${params.toString()}`
-      );
-      const doc = await vscode.workspace.openTextDocument(uri);
-      await vscode.window.showTextDocument(doc, { preview: false });
-    } catch (e) {
-      helpers.showAndLogErrorMessage(e.message);
+    if (!singleItem) {
+      throw new Error(NO_QUERY_SELECTED);
     }
+
+    const queryName = singleItem.queryName.endsWith('.ql')
+      ? singleItem.queryName
+      : singleItem.queryName + '.ql';
+    const params = new URLSearchParams({
+      isQuickEval: String(!!singleItem.query.quickEvalPosition),
+      queryText: encodeURIComponent(await this.getQueryText(singleItem)),
+    });
+    const uri = vscode.Uri.parse(
+      `codeql:${singleItem.query.queryID}-${queryName}?${params.toString()}`, true
+    );
+    const doc = await vscode.workspace.openTextDocument(uri);
+    await vscode.window.showTextDocument(doc, { preview: false });
   }
 
   async handleViewSarif(
@@ -433,21 +467,30 @@ export class QueryHistoryManager {
       return;
     }
 
-    try {
-      const hasInterpretedResults = await singleItem.query.canHaveInterpretedResults();
-      if (hasInterpretedResults) {
-        await this.tryOpenExternalFile(
-          singleItem.query.resultsPaths.interpretedResultsPath
-        );
-      } else {
-        const label = singleItem.getLabel();
-        helpers.showAndLogInformationMessage(
-          `Query ${label} has no interpreted results.`
-        );
-      }
-    } catch (e) {
-      helpers.showAndLogErrorMessage(e.message);
+    const hasInterpretedResults = await singleItem.query.canHaveInterpretedResults();
+    if (hasInterpretedResults) {
+      await this.tryOpenExternalFile(
+        singleItem.query.resultsPaths.interpretedResultsPath
+      );
+    } else {
+      const label = singleItem.getLabel();
+      showAndLogInformationMessage(
+        `Query ${label} has no interpreted results.`
+      );
     }
+  }
+
+  async handleViewDil(
+    singleItem: CompletedQuery,
+    multiSelect: CompletedQuery[],
+  ) {
+    if (!this.assertSingleQuery(multiSelect)) {
+      return;
+    }
+
+    await this.tryOpenExternalFile(
+      await singleItem.query.ensureDilPath(this.qs)
+    );
   }
 
   async getQueryText(queryHistoryItem: CompletedQuery): Promise<string> {
@@ -470,7 +513,7 @@ export class QueryHistoryManager {
 
   addQuery(info: QueryWithResults): CompletedQuery {
     const item = new CompletedQuery(info, this.queryHistoryConfigListener);
-    this.treeDataProvider.push(item);
+    this.treeDataProvider.pushQuery(item);
     this.updateTreeViewSelectionIfVisible();
     return item;
   }
@@ -502,7 +545,7 @@ export class QueryHistoryManager {
   private async tryOpenExternalFile(fileLocation: string) {
     const uri = vscode.Uri.file(fileLocation);
     try {
-      await vscode.window.showTextDocument(uri);
+      await vscode.window.showTextDocument(uri, { preview: false });
     } catch (e) {
       if (
         e.message.includes(
@@ -510,7 +553,7 @@ export class QueryHistoryManager {
         ) ||
         e.message.includes('too large to open')
       ) {
-        const res = await helpers.showBinaryChoiceDialog(
+        const res = await showBinaryChoiceDialog(
           `VS Code does not allow extensions to open files >50MB. This file
 exceeds that limit. Do you want to open it outside of VS Code?
 
@@ -521,11 +564,11 @@ the file in the file explorer and dragging it into the workspace.`
           try {
             await vscode.commands.executeCommand('revealFileInOS', uri);
           } catch (e) {
-            helpers.showAndLogErrorMessage(e.message);
+            showAndLogErrorMessage(e.message);
           }
         }
       } else {
-        helpers.showAndLogErrorMessage(`Could not open file ${fileLocation}`);
+        showAndLogErrorMessage(`Could not open file ${fileLocation}`);
         logger.log(e.message);
         logger.log(e.stack);
       }
@@ -579,7 +622,7 @@ the file in the file explorer and dragging it into the workspace.`
 
   private assertSingleQuery(multiSelect: CompletedQuery[] = [], message = 'Please select a single query.') {
     if (multiSelect.length > 1) {
-      helpers.showAndLogErrorMessage(
+      showAndLogErrorMessage(
         message
       );
       return false;
@@ -614,5 +657,36 @@ the file in the file explorer and dragging it into the workspace.`
     ) {
       this.compareWithItem = undefined;
     }
+  }
+
+  /**
+   * If no items are selected, attempt to grab the selection from the treeview.
+   * We need to use this method because when clicking on commands from the view title
+   * bar, the selections are not passed in.
+   *
+   * @param singleItem the single item selected, or undefined if no item is selected
+   * @param multiSelect a multi-select or undefined if no items are selected
+   */
+  private determineSelection(
+    singleItem: CompletedQuery,
+    multiSelect: CompletedQuery[]
+  ): { finalSingleItem: CompletedQuery; finalMultiSelect: CompletedQuery[] } {
+    if (singleItem === undefined && (multiSelect === undefined || multiSelect.length === 0 || multiSelect[0] === undefined)) {
+      const selection = this.treeView.selection;
+      if (selection) {
+        return {
+          finalSingleItem: selection[0],
+          finalMultiSelect: selection
+        };
+      }
+    }
+    return {
+      finalSingleItem: singleItem,
+      finalMultiSelect: multiSelect
+    };
+  }
+
+  async refreshTreeView(completedQuery: CompletedQuery): Promise<void> {
+    this.treeDataProvider.refresh(completedQuery);
   }
 }

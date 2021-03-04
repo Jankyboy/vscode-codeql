@@ -15,8 +15,7 @@ import {
 import { TestAdapterRegistrar } from 'vscode-test-adapter-util';
 import { QLTestFile, QLTestNode, QLTestDirectory, QLTestDiscovery } from './qltest-discovery';
 import { Event, EventEmitter, CancellationTokenSource, CancellationToken } from 'vscode';
-import { DisposableObject } from './vscode-utils/disposable-object';
-import { QLPackDiscovery } from './qlpack-discovery';
+import { DisposableObject } from './pure/disposable-object';
 import { CodeQLCliServer } from './cli';
 import { getOnDiskWorkspaceFolders } from './helpers';
 import { testLogger } from './logging';
@@ -82,7 +81,6 @@ function changeExtension(p: string, ext: string): string {
  * Test adapter for QL tests.
  */
 export class QLTestAdapter extends DisposableObject implements TestAdapter {
-  private readonly qlPackDiscovery: QLPackDiscovery;
   private readonly qlTestDiscovery: QLTestDiscovery;
   private readonly _tests = this.push(
     new EventEmitter<TestLoadStartedEvent | TestLoadFinishedEvent>());
@@ -97,9 +95,7 @@ export class QLTestAdapter extends DisposableObject implements TestAdapter {
   ) {
     super();
 
-    this.qlPackDiscovery = this.push(new QLPackDiscovery(workspaceFolder, cliServer));
-    this.qlTestDiscovery = this.push(new QLTestDiscovery(this.qlPackDiscovery, workspaceFolder, cliServer));
-    this.qlPackDiscovery.refresh();
+    this.qlTestDiscovery = this.push(new QLTestDiscovery(workspaceFolder, cliServer));
     this.qlTestDiscovery.refresh();
 
     this.push(this.qlTestDiscovery.onDidChangeTests(this.discoverTests, this));
@@ -160,20 +156,20 @@ export class QLTestAdapter extends DisposableObject implements TestAdapter {
   private discoverTests(): void {
     this._tests.fire({ type: 'started' } as TestLoadStartedEvent);
 
-    const testDirectories = this.qlTestDiscovery.testDirectories;
-    const children = testDirectories.map(
-      testDirectory => QLTestAdapter.createTestSuiteInfo(testDirectory, testDirectory.name)
-    );
-    const testSuite: TestSuiteInfo = {
-      type: 'suite',
-      label: 'CodeQL',
-      id: '.',
-      children
-    };
-
+    const testDirectory = this.qlTestDiscovery.testDirectory;
+    let testSuite: TestSuiteInfo | undefined;
+    if (testDirectory?.children.length) {
+      const children = QLTestAdapter.createTestOrSuiteInfos(testDirectory.children);
+      testSuite = {
+        type: 'suite',
+        label: 'CodeQL',
+        id: testDirectory.path,
+        children
+      };
+    }
     this._tests.fire({
       type: 'finished',
-      suite: children.length > 0 ? testSuite : undefined
+      suite: testSuite
     } as TestLoadFinishedEvent);
   }
 
@@ -221,10 +217,25 @@ export class QLTestAdapter extends DisposableObject implements TestAdapter {
       cancellationToken: cancellationToken,
       logger: testLogger
     })) {
+      const state = event.pass
+        ? 'passed'
+        : event.messages?.length
+          ? 'errored'
+          : 'failed';
+      let message: string | undefined;
+      if (event.diff?.length) {
+        message = ['', `${state}: ${event.test}`, ...event.diff, ''].join('\n');
+        testLogger.log(message);
+      }
       this._testStates.fire({
         type: 'test',
-        state: event.pass ? 'passed' : 'failed',
-        test: event.test
+        state,
+        test: event.test,
+        message,
+        decorations: event.messages?.map(msg => ({
+          line: msg.position.line,
+          message: msg.message
+        }))
       });
     }
   }

@@ -4,16 +4,21 @@ import * as child_process from 'child_process';
 import * as fs from 'fs-extra';
 import * as path from 'path';
 import * as sarif from 'sarif';
+import { SemVer } from 'semver';
 import { Readable } from 'stream';
 import { StringDecoder } from 'string_decoder';
 import * as tk from 'tree-kill';
-import * as util from 'util';
+import { promisify } from 'util';
 import { CancellationToken, Disposable } from 'vscode';
-import { BQRSInfo, DecodedBqrsChunk } from './bqrs-cli-types';
-import { DistributionProvider } from './distribution';
-import { assertNever } from './helpers-pure';
-import { QueryMetadata, SortDirection } from './interface-types';
+
+import { BQRSInfo, DecodedBqrsChunk } from './pure/bqrs-cli-types';
+import * as config from './config';
+import { CliConfig } from './config';
+import { DistributionProvider, FindDistributionResultKind } from './distribution';
+import { assertNever } from './pure/helpers-pure';
+import { QueryMetadata, SortDirection } from './pure/interface-types';
 import { Logger, ProgressReporter } from './logging';
+import { CompilationMessage } from './pure/messages';
 
 /**
  * The version of the SARIF format that we are using.
@@ -46,6 +51,7 @@ export interface DbInfo {
   sourceArchiveRoot: string;
   datasetFolder: string;
   logsFolder: string;
+  languages: string[];
 }
 
 /**
@@ -54,6 +60,7 @@ export interface DbInfo {
 export interface UpgradesInfo {
   scripts: string[];
   finalDbscheme: string;
+  matchesTarget?: boolean;
 }
 
 /**
@@ -87,10 +94,11 @@ export interface TestRunOptions {
 export interface TestCompleted {
   test: string;
   pass: boolean;
-  messages: string[];
+  messages: CompilationMessage[];
   compilationMs: number;
   evaluationMs: number;
   expected: string;
+  diff: string[] | undefined;
 }
 
 /**
@@ -113,6 +121,22 @@ interface BqrsDecodeOptions {
  */
 export class CodeQLCliServer implements Disposable {
 
+  /**
+   * CLI version where --kind=DIL was introduced
+   */
+  private static CLI_VERSION_WITH_DECOMPILE_KIND_DIL = new SemVer('2.3.0');
+
+  /**
+   * CLI version where languages are exposed during a `codeql resolve database` command.
+   */
+  private static CLI_VERSION_WITH_LANGUAGE = new SemVer('2.4.1');
+
+  /**
+   * CLI version where `codeql resolve upgrades` supports
+   * the `--allow-downgrades` flag
+   */
+  private static CLI_VERSION_WITH_DOWNGRADES = new SemVer('2.4.4');
+
   /** The process for the cli server, or undefined if one doesn't exist yet */
   process?: child_process.ChildProcessWithoutNullStreams;
   /** Queue of future commands*/
@@ -122,17 +146,38 @@ export class CodeQLCliServer implements Disposable {
   /**  A buffer with a single null byte. */
   nullBuffer: Buffer;
 
-  constructor(private config: DistributionProvider, private logger: Logger) {
+  /** Version of current cli, lazily computed by the `getVersion()` method */
+  private _version: SemVer | undefined;
+
+  /** Path to current codeQL executable, or undefined if not running yet. */
+  codeQlPath: string | undefined;
+
+  /**
+   * When set to true, ignore some modal popups and assume user has clicked "yes".
+   */
+  public quiet = false;
+
+  constructor(
+    private distributionProvider: DistributionProvider,
+    private cliConfig: CliConfig,
+    private logger: Logger
+  ) {
     this.commandQueue = [];
     this.commandInProcess = false;
     this.nullBuffer = Buffer.alloc(1);
-    if (this.config.onDidChangeDistribution) {
-      this.config.onDidChangeDistribution(() => {
+    if (this.distributionProvider.onDidChangeDistribution) {
+      this.distributionProvider.onDidChangeDistribution(() => {
         this.restartCliServer();
+        this._version = undefined;
+      });
+    }
+    if (this.cliConfig.onDidChangeConfiguration) {
+      this.cliConfig.onDidChangeConfiguration(() => {
+        this.restartCliServer();
+        this._version = undefined;
       });
     }
   }
-
 
   dispose(): void {
     this.killProcessIfRunning();
@@ -188,7 +233,7 @@ export class CodeQLCliServer implements Disposable {
    * Get the path to the CodeQL CLI distribution, or throw an exception if not found.
    */
   private async getCodeQlPath(): Promise<string> {
-    const codeqlPath = await this.config.getCodeQlPathWithoutVersionCheck();
+    const codeqlPath = await this.distributionProvider.getCodeQlPathWithoutVersionCheck();
     if (!codeqlPath) {
       throw new Error('Failed to find CodeQL distribution.');
     }
@@ -199,8 +244,15 @@ export class CodeQLCliServer implements Disposable {
    * Launch the cli server
    */
   private async launchProcess(): Promise<child_process.ChildProcessWithoutNullStreams> {
-    const config = await this.getCodeQlPath();
-    return spawnServer(config, 'CodeQL CLI Server', ['execute', 'cli-server'], [], this.logger, _data => { /**/ });
+    const codeQlPath = await this.getCodeQlPath();
+    return await spawnServer(
+      codeQlPath,
+      'CodeQL CLI Server',
+      ['execute', 'cli-server'],
+      [],
+      this.logger,
+      _data => { /**/ }
+    );
   }
 
   private async runCodeQlCliInternal(command: string[], commandArgs: string[], description: string): Promise<string> {
@@ -224,7 +276,7 @@ export class CodeQLCliServer implements Disposable {
       const argsString = args.join(' ');
       this.logger.log(`${description} using CodeQL CLI: ${argsString}...`);
       try {
-        await new Promise((resolve, reject) => {
+        await new Promise<void>((resolve, reject) => {
           // Start listening to stdout
           process.stdout.addListener('data', (newData: Buffer) => {
             stdoutBuffers.push(newData);
@@ -440,7 +492,11 @@ export class CodeQLCliServer implements Disposable {
     const subcommandArgs = [
       testPath
     ];
-    return await this.runJsonCodeQlCliCommand<ResolvedTests>(['resolve', 'tests'], subcommandArgs, 'Resolving tests');
+    return await this.runJsonCodeQlCliCommand<ResolvedTests>(
+      ['resolve', 'tests', '--strict-test-discovery'],
+      subcommandArgs,
+      'Resolving tests'
+    );
   }
 
   /**
@@ -455,7 +511,8 @@ export class CodeQLCliServer implements Disposable {
 
     const subcommandArgs = [
       '--additional-packs', workspaces.join(path.delimiter),
-      '--threads', '8',
+      '--threads',
+      this.cliConfig.numberTestThreads.toString(),
       ...testPaths
     ];
 
@@ -525,8 +582,7 @@ export class CodeQLCliServer implements Disposable {
     return await this.runJsonCodeQlCliCommand<DecodedBqrsChunk>(['bqrs', 'decode'], subcommandArgs, 'Reading bqrs data');
   }
 
-
-  async interpretBqrs(metadata: { kind: string; id: string }, resultsPath: string, interpretedResultsPath: string, sourceInfo?: SourceInfo): Promise<sarif.Log> {
+  async interpretBqrs(metadata: { kind: string; id: string; scored?: string }, resultsPath: string, interpretedResultsPath: string, sourceInfo?: SourceInfo): Promise<sarif.Log> {
     const args = [
       `-t=kind=${metadata.kind}`,
       `-t=id=${metadata.id}`,
@@ -538,20 +594,33 @@ export class CodeQLCliServer implements Disposable {
       // grouping client-side.
       '--no-group-results',
     ];
+    if (config.isCanary() && metadata.scored !== undefined) {
+      args.push(`-t=scored=${metadata.scored}`);
+    }
     if (sourceInfo !== undefined) {
       args.push(
         '--source-archive', sourceInfo.sourceArchive,
         '--source-location-prefix', sourceInfo.sourceLocationPrefix
       );
     }
+
+    args.push(
+      '--threads',
+      this.cliConfig.numberThreads.toString(),
+    );
+
     args.push(resultsPath);
     await this.runCodeQlCliCommand(['bqrs', 'interpret'], args, 'Interpreting query results');
 
     let output: string;
     try {
       output = await fs.readFile(interpretedResultsPath, 'utf8');
-    } catch (err) {
-      throw new Error(`Reading output of interpretation failed: ${err.stderr || err}`);
+    } catch (e) {
+      const rawMessage = e.stderr || e.message;
+      const errorMessage = rawMessage.startsWith('Cannot create a string')
+        ? `SARIF too large. ${rawMessage}`
+        : rawMessage;
+      throw new Error(`Reading output of interpretation failed: ${errorMessage}`);
     }
     try {
       return JSON.parse(output) as sarif.Log;
@@ -599,12 +668,19 @@ export class CodeQLCliServer implements Disposable {
    * Gets information necessary for upgrading a database.
    * @param dbScheme the path to the dbscheme of the database to be upgraded.
    * @param searchPath A list of directories to search for upgrade scripts.
+   * @param allowDowngradesIfPossible Whether we should try and include downgrades of we can.
+   * @param targetDbScheme The dbscheme to try to upgrade to.
    * @returns A list of database upgrade script directories
    */
-  resolveUpgrades(dbScheme: string, searchPath: string[]): Promise<UpgradesInfo> {
+  async resolveUpgrades(dbScheme: string, searchPath: string[], allowDowngradesIfPossible: boolean, targetDbScheme?: string): Promise<UpgradesInfo> {
     const args = ['--additional-packs', searchPath.join(path.delimiter), '--dbscheme', dbScheme];
-
-    return this.runJsonCodeQlCliCommand<UpgradesInfo>(
+    if (targetDbScheme) {
+      args.push('--target-dbscheme', targetDbScheme);
+      if (allowDowngradesIfPossible && await this.supportsDowngrades()) {
+        args.push('--allow-downgrades');
+      }
+    }
+    return await this.runJsonCodeQlCliCommand<UpgradesInfo>(
       ['resolve', 'upgrades'],
       args,
       'Resolving database upgrade scripts',
@@ -650,6 +726,51 @@ export class CodeQLCliServer implements Disposable {
       args,
       'Resolving queries',
     );
+  }
+
+  async generateDil(qloFile: string, outFile: string): Promise<void> {
+    const extraArgs = await this.supportsDecompileDil()
+      ? ['--kind', 'dil', '-o', outFile, qloFile]
+      : ['-o', outFile, qloFile];
+    await this.runCodeQlCliCommand(
+      ['query', 'decompile'],
+      extraArgs,
+      'Generating DIL',
+    );
+  }
+
+  public async getVersion() {
+    if (!this._version) {
+      this._version = await this.refreshVersion();
+    }
+    return this._version;
+  }
+
+  private async supportsDecompileDil() {
+    return (await this.getVersion()).compare(CodeQLCliServer.CLI_VERSION_WITH_DECOMPILE_KIND_DIL) >= 0;
+  }
+
+  public async supportsLanguageName() {
+    return (await this.getVersion()).compare(CodeQLCliServer.CLI_VERSION_WITH_LANGUAGE) >= 0;
+  }
+
+  public async supportsDowngrades() {
+    return (await this.getVersion()).compare(CodeQLCliServer.CLI_VERSION_WITH_DOWNGRADES) >= 0;
+  }
+
+  private async refreshVersion() {
+    const distribution = await this.distributionProvider.getDistribution();
+    switch (distribution.kind) {
+      case FindDistributionResultKind.CompatibleDistribution:
+      // eslint-disable-next-line no-fallthrough
+      case FindDistributionResultKind.IncompatibleDistribution:
+        return distribution.version;
+
+      default:
+        // We should not get here because if no distributions are available, then
+        // the cli class is never instantiated.
+        throw new Error('No distribution found');
+    }
   }
 }
 
@@ -708,7 +829,7 @@ export function spawnServer(
 
 /**
  * Runs a CodeQL CLI command without invoking the CLI server, returning the output as a string.
- * @param config The configuration containing the path to the CLI.
+ * @param codeQlPath The path to the CLI.
  * @param command The `codeql` command to be run, provided as an array of command/subcommand names.
  * @param commandArgs The arguments to pass to the `codeql` command.
  * @param description Description of the action being run, to be shown in log and error messages.
@@ -716,7 +837,14 @@ export function spawnServer(
  * @param progressReporter Used to output progress messages, e.g. to the status bar.
  * @returns The contents of the command's stdout, if the command succeeded.
  */
-export async function runCodeQlCliCommand(codeQlPath: string, command: string[], commandArgs: string[], description: string, logger: Logger, progressReporter?: ProgressReporter): Promise<string> {
+export async function runCodeQlCliCommand(
+  codeQlPath: string,
+  command: string[],
+  commandArgs: string[],
+  description: string,
+  logger: Logger,
+  progressReporter?: ProgressReporter
+): Promise<string> {
   // Add logging arguments first, in case commandArgs contains positional parameters.
   const args = command.concat(LOGGING_FLAGS).concat(commandArgs);
   const argsString = args.join(' ');
@@ -725,7 +853,7 @@ export async function runCodeQlCliCommand(codeQlPath: string, command: string[],
       progressReporter.report({ message: description });
     }
     logger.log(`${description} using CodeQL CLI: ${codeQlPath} ${argsString}...`);
-    const result = await util.promisify(child_process.execFile)(codeQlPath, args);
+    const result = await promisify(child_process.execFile)(codeQlPath, args);
     logger.log(result.stderr);
     logger.log('CLI command succeeded.');
     return result.stdout;
@@ -830,4 +958,17 @@ async function logStream(stream: Readable, logger: Logger): Promise<void> {
   for await (const line of await splitStreamAtSeparators(stream, lineEndings)) {
     logger.log(line);
   }
+}
+
+
+export function shouldDebugIdeServer() {
+  return 'IDE_SERVER_JAVA_DEBUG' in process.env
+    && process.env.IDE_SERVER_JAVA_DEBUG !== '0'
+    && process.env.IDE_SERVER_JAVA_DEBUG?.toLocaleLowerCase() !== 'false';
+}
+
+export function shouldDebugQueryServer() {
+  return 'QUERY_SERVER_JAVA_DEBUG' in process.env
+    && process.env.QUERY_SERVER_JAVA_DEBUG !== '0'
+    && process.env.QUERY_SERVER_JAVA_DEBUG?.toLocaleLowerCase() !== 'false';
 }

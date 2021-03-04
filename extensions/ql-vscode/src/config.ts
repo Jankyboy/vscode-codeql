@@ -1,10 +1,10 @@
-import { DisposableObject } from './vscode-utils/disposable-object';
+import { DisposableObject } from './pure/disposable-object';
 import { workspace, Event, EventEmitter, ConfigurationChangeEvent, ConfigurationTarget } from 'vscode';
 import { DistributionManager } from './distribution';
 import { logger } from './logging';
 
 /** Helper class to look up a labelled (and possibly nested) setting. */
-class Setting {
+export class Setting {
   name: string;
   parent?: Setting;
 
@@ -39,10 +39,18 @@ class Setting {
 
 const ROOT_SETTING = new Setting('codeQL');
 
-// Distribution configuration
+// Global configuration
+const TELEMETRY_SETTING = new Setting('telemetry', ROOT_SETTING);
+const GLOBAL_TELEMETRY_SETTING = new Setting('telemetry');
 
+export const LOG_TELEMETRY = new Setting('logTelemetry', TELEMETRY_SETTING);
+export const ENABLE_TELEMETRY = new Setting('enableTelemetry', TELEMETRY_SETTING);
+
+export const GLOBAL_ENABLE_TELEMETRY = new Setting('enableTelemetry', GLOBAL_TELEMETRY_SETTING);
+
+// Distribution configuration
 const DISTRIBUTION_SETTING = new Setting('cli', ROOT_SETTING);
-const CUSTOM_CODEQL_PATH_SETTING = new Setting('executablePath', DISTRIBUTION_SETTING);
+export const CUSTOM_CODEQL_PATH_SETTING = new Setting('executablePath', DISTRIBUTION_SETTING);
 const INCLUDE_PRERELEASE_SETTING = new Setting('includePrerelease', DISTRIBUTION_SETTING);
 const PERSONAL_ACCESS_TOKEN_SETTING = new Setting('personalAccessToken', DISTRIBUTION_SETTING);
 const QUERY_HISTORY_SETTING = new Setting('queryHistory', ROOT_SETTING);
@@ -52,12 +60,13 @@ const QUERY_HISTORY_FORMAT_SETTING = new Setting('format', QUERY_HISTORY_SETTING
 const DISTRIBUTION_CHANGE_SETTINGS = [CUSTOM_CODEQL_PATH_SETTING, INCLUDE_PRERELEASE_SETTING, PERSONAL_ACCESS_TOKEN_SETTING];
 
 export interface DistributionConfig {
-  customCodeQlPath?: string;
+  readonly customCodeQlPath?: string;
+  updateCustomCodeQlPath: (newPath: string | undefined) => Promise<void>;
   includePrerelease: boolean;
   personalAccessToken?: string;
   ownerName?: string;
   repositoryName?: string;
-  onDidChangeDistributionConfiguration?: Event<void>;
+  onDidChangeConfiguration?: Event<void>;
 }
 
 // Query server configuration
@@ -67,7 +76,13 @@ const NUMBER_OF_THREADS_SETTING = new Setting('numberOfThreads', RUNNING_QUERIES
 const TIMEOUT_SETTING = new Setting('timeout', RUNNING_QUERIES_SETTING);
 const MEMORY_SETTING = new Setting('memory', RUNNING_QUERIES_SETTING);
 const DEBUG_SETTING = new Setting('debug', RUNNING_QUERIES_SETTING);
+const RUNNING_TESTS_SETTING = new Setting('runningTests', ROOT_SETTING);
+const RESULTS_DISPLAY_SETTING = new Setting('resultsDisplay', ROOT_SETTING);
+
+export const NUMBER_OF_TEST_THREADS_SETTING = new Setting('numberOfThreads', RUNNING_TESTS_SETTING);
+export const MAX_QUERIES = new Setting('maxQueries', RUNNING_QUERIES_SETTING);
 export const AUTOSAVE_SETTING = new Setting('autoSave', RUNNING_QUERIES_SETTING);
+export const PAGE_SIZE = new Setting('pageSize', RESULTS_DISPLAY_SETTING);
 
 /** When these settings change, the running query server should be restarted. */
 const QUERY_SERVER_RESTARTING_SETTINGS = [NUMBER_OF_THREADS_SETTING, MEMORY_SETTING, DEBUG_SETTING];
@@ -78,7 +93,7 @@ export interface QueryServerConfig {
   numThreads: number;
   queryMemoryMb?: number;
   timeoutSecs: number;
-  onDidChangeQueryServerConfiguration?: Event<void>;
+  onDidChangeConfiguration?: Event<void>;
 }
 
 /** When these settings change, the query history should be refreshed. */
@@ -86,10 +101,19 @@ const QUERY_HISTORY_SETTINGS = [QUERY_HISTORY_FORMAT_SETTING];
 
 export interface QueryHistoryConfig {
   format: string;
-  onDidChangeQueryHistoryConfiguration: Event<void>;
+  onDidChangeConfiguration: Event<void>;
 }
 
-abstract class ConfigListener extends DisposableObject {
+const CLI_SETTINGS = [NUMBER_OF_TEST_THREADS_SETTING, NUMBER_OF_THREADS_SETTING];
+
+export interface CliConfig {
+  numberTestThreads: number;
+  numberThreads: number;
+  onDidChangeConfiguration?: Event<void>;
+}
+
+
+export abstract class ConfigListener extends DisposableObject {
   protected readonly _onDidChangeConfiguration = this.push(new EventEmitter<void>());
 
   constructor() {
@@ -116,6 +140,10 @@ abstract class ConfigListener extends DisposableObject {
   private updateConfiguration(): void {
     this._onDidChangeConfiguration.fire();
   }
+
+  public get onDidChangeConfiguration(): Event<void> {
+    return this._onDidChangeConfiguration.event;
+  }
 }
 
 export class DistributionConfigListener extends ConfigListener implements DistributionConfig {
@@ -131,8 +159,8 @@ export class DistributionConfigListener extends ConfigListener implements Distri
     return PERSONAL_ACCESS_TOKEN_SETTING.getValue() || undefined;
   }
 
-  public get onDidChangeDistributionConfiguration(): Event<void> {
-    return this._onDidChangeConfiguration.event;
+  public async updateCustomCodeQlPath(newPath: string | undefined) {
+    await CUSTOM_CODEQL_PATH_SETTING.updateValue(newPath, ConfigurationTarget.Global);
   }
 
   protected handleDidChangeConfiguration(e: ConfigurationChangeEvent): void {
@@ -141,7 +169,7 @@ export class DistributionConfigListener extends ConfigListener implements Distri
 }
 
 export class QueryServerConfigListener extends ConfigListener implements QueryServerConfig {
-  private constructor(private _codeQlPath: string) {
+  public constructor(private _codeQlPath = '') {
     super();
   }
 
@@ -187,10 +215,6 @@ export class QueryServerConfigListener extends ConfigListener implements QuerySe
     return DEBUG_SETTING.getValue<boolean>();
   }
 
-  public get onDidChangeQueryServerConfiguration(): Event<void> {
-    return this._onDidChangeConfiguration.event;
-  }
-
   protected handleDidChangeConfiguration(e: ConfigurationChangeEvent): void {
     this.handleDidChangeConfigurationForRelevantSettings(QUERY_SERVER_RESTARTING_SETTINGS, e);
   }
@@ -201,12 +225,24 @@ export class QueryHistoryConfigListener extends ConfigListener implements QueryH
     this.handleDidChangeConfigurationForRelevantSettings(QUERY_HISTORY_SETTINGS, e);
   }
 
-  public get onDidChangeQueryHistoryConfiguration(): Event<void> {
-    return this._onDidChangeConfiguration.event;
-  }
-
   public get format(): string {
     return QUERY_HISTORY_FORMAT_SETTING.getValue<string>();
+  }
+}
+
+export class CliConfigListener extends ConfigListener implements CliConfig {
+
+  public get numberTestThreads(): number {
+    return NUMBER_OF_TEST_THREADS_SETTING.getValue();
+  }
+
+
+  public get numberThreads(): number {
+    return NUMBER_OF_THREADS_SETTING.getValue<number>();
+  }
+
+  protected handleDidChangeConfiguration(e: ConfigurationChangeEvent): void {
+    this.handleDidChangeConfigurationForRelevantSettings(CLI_SETTINGS, e);
   }
 }
 
@@ -219,5 +255,11 @@ export class QueryHistoryConfigListener extends ConfigListener implements QueryH
  * their vscode settings json file.
  */
 
-/* Advanced setting: used to enable the AST Viewer. */
-export const EXPERIMENTAL_AST_VIEWER = new Setting('experimentalAstViewer', ROOT_SETTING);
+/**
+ * Enables canary features of this extension. Recommended for all internal users.
+ */
+export const CANARY_FEATURES = new Setting('canary', ROOT_SETTING);
+
+export function isCanary() {
+  return !!CANARY_FEATURES.getValue<boolean>();
+}

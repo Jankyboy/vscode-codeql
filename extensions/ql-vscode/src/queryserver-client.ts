@@ -1,13 +1,15 @@
 import * as cp from 'child_process';
 import * as path from 'path';
-import { DisposableObject } from './vscode-utils/disposable-object';
-import { Disposable } from 'vscode';
-import { CancellationToken, createMessageConnection, MessageConnection, RequestType } from 'vscode-jsonrpc';
+import { DisposableObject } from './pure/disposable-object';
+import { Disposable, CancellationToken, commands } from 'vscode';
+import { createMessageConnection, MessageConnection, RequestType } from 'vscode-jsonrpc';
 import * as cli from './cli';
 import { QueryServerConfig } from './config';
 import { Logger, ProgressReporter } from './logging';
-import { completeQuery, EvaluationResult, progress, ProgressMessage, WithProgressId } from './messages';
-import * as messages from './messages';
+import { completeQuery, EvaluationResult, progress, ProgressMessage, WithProgressId } from './pure/messages';
+import * as messages from './pure/messages';
+import { SemVer } from 'semver';
+import { ProgressCallback, ProgressTask } from './commandRunner';
 
 type ServerOpts = {
   logger: Logger;
@@ -47,22 +49,41 @@ type WithProgressReporting = (task: (progress: ProgressReporter, token: Cancella
  * to restart it (which disposes the existing process and starts a new one).
  */
 export class QueryServerClient extends DisposableObject {
+
+  /**
+   * Query Server version where database registration was introduced
+   */
+  private static VERSION_WITH_DB_REGISTRATION = new SemVer('2.4.1');
+
   serverProcess?: ServerProcess;
   evaluationResultCallbacks: { [key: number]: (res: EvaluationResult) => void };
   progressCallbacks: { [key: number]: ((res: ProgressMessage) => void) | undefined };
   nextCallback: number;
   nextProgress: number;
   withProgressReporting: WithProgressReporting;
+
+  private readonly queryServerStartListeners = [] as ProgressTask<void>[];
+
+  // Can't use standard vscode EventEmitter here since they do not cause the calling
+  // function to fail if one of the event handlers fail. This is something that
+  // we need here.
+  readonly onDidStartQueryServer = (e: ProgressTask<void>) => {
+    this.queryServerStartListeners.push(e);
+  }
+
   public activeQueryName: string | undefined;
 
-  constructor(readonly config: QueryServerConfig, readonly cliServer: cli.CodeQLCliServer, readonly opts: ServerOpts, withProgressReporting: WithProgressReporting) {
+  constructor(
+    readonly config: QueryServerConfig,
+    readonly cliServer: cli.CodeQLCliServer,
+    readonly opts: ServerOpts,
+    withProgressReporting: WithProgressReporting
+  ) {
     super();
     // When the query server configuration changes, restart the query server.
-    if (config.onDidChangeQueryServerConfiguration !== undefined) {
-      this.push(config.onDidChangeQueryServerConfiguration(async () => {
-        this.logger.log('Restarting query server due to configuration changes...');
-        await this.restartQueryServer();
-      }, this));
+    if (config.onDidChangeConfiguration !== undefined) {
+      this.push(config.onDidChangeConfiguration(() =>
+        commands.executeCommand('codeQL.restartQueryServer')));
     }
     this.withProgressReporting = withProgressReporting;
     this.nextCallback = 0;
@@ -85,9 +106,19 @@ export class QueryServerClient extends DisposableObject {
   }
 
   /** Restarts the query server by disposing of the current server process and then starting a new one. */
-  async restartQueryServer(): Promise<void> {
+  async restartQueryServer(
+    progress: ProgressCallback,
+    token: CancellationToken
+  ): Promise<void> {
     this.stopQueryServer();
     await this.startQueryServer();
+
+    // Ensure we await all responses from event handlers so that
+    // errors can be properly reported to the user.
+    await Promise.all(this.queryServerStartListeners.map(handler => handler(
+      progress,
+      token
+    )));
   }
 
   showLog(): void {
@@ -104,9 +135,19 @@ export class QueryServerClient extends DisposableObject {
   private async startQueryServerImpl(progressReporter: ProgressReporter): Promise<void> {
     const ramArgs = await this.cliServer.resolveRam(this.config.queryMemoryMb, progressReporter);
     const args = ['--threads', this.config.numThreads.toString()].concat(ramArgs);
+
+    if (await this.supportsDatabaseRegistration()) {
+      args.push('--require-db-registration');
+    }
+
     if (this.config.debug) {
       args.push('--debug', '--tuple-counting');
     }
+
+    if (cli.shouldDebugQueryServer()) {
+      args.push('-J=-agentlib:jdwp=transport=dt_socket,address=localhost:9010,server=y,suspend=n,quiet=y');
+    }
+
     const child = cli.spawnServer(
       this.config.codeQlPath,
       'CodeQL query server',
@@ -150,6 +191,10 @@ export class QueryServerClient extends DisposableObject {
     this.nextProgress = 0;
     this.progressCallbacks = {};
     this.evaluationResultCallbacks = {};
+  }
+
+  async supportsDatabaseRegistration() {
+    return (await this.cliServer.getVersion()).compare(QueryServerClient.VERSION_WITH_DB_REGISTRATION) >= 0;
   }
 
   registerCallback(callback: (res: EvaluationResult) => void): number {

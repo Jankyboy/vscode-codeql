@@ -2,6 +2,98 @@
 
 ## [UNRELEASED]
 
+- Respect the `codeQL.runningQueries.numberOfThreads` setting when creating SARIF files during result interpretation. [#771](https://github.com/github/vscode-codeql/pull/771)
+- Allow using raw LGTM project slugs for fetching LGTM databases. [#769](https://github.com/github/vscode-codeql/pull/769)
+- Better error messages when BQRS interpretation fails to produce SARIF. [#770](https://github.com/github/vscode-codeql/pull/770)
+
+## 1.4.3 - 22 February 2021
+
+- Avoid displaying an error when removing orphaned databases and the storage folder does not exist. [#748](https://github.com/github/vscode-codeql/pull/748)
+- Add better error messages when AST Viewer is unable to create an AST. [#753](https://github.com/github/vscode-codeql/pull/753)
+- Cache AST viewing operations so that subsequent calls to view the AST of a single file will be extremely fast. [#753](https://github.com/github/vscode-codeql/pull/753)
+- Ensure CodeQL version in status bar updates correctly when version changes. [#754](https://github.com/github/vscode-codeql/pull/754)
+- Avoid deleting the quick query file when it is re-opened. [#747](https://github.com/github/vscode-codeql/pull/747)
+
+## 1.4.2 - 2 February 2021
+
+- Add a status bar item for the CodeQL CLI to show the current version. [#741](https://github.com/github/vscode-codeql/pull/741)
+- Fix version constraint for flagging CLI support of non-destructive updates. [#744](https://github.com/github/vscode-codeql/pull/744)
+- Add a _More Information_ button in the telemetry popup that opens [TELEMETRY.md](https://github.com/github/vscode-codeql/blob/main/extensions/ql-vscode/TELEMETRY.md) in a browser tab. [#742](https://github.com/github/vscode-codeql/pull/742)
+
+## 1.4.1 - 29 January 2021
+
+- Reword the telemetry modal dialog box. [#738](https://github.com/github/vscode-codeql/pull/738)
+
+## 1.4.0 - 29 January 2021
+
+- Fix bug where databases are not reregistered when the query server restarts. [#734](https://github.com/github/vscode-codeql/pull/734)
+- Fix bug where upgrade requests were erroneously being marked as failed. [#734](https://github.com/github/vscode-codeql/pull/734)
+- On a strictly opt-in basis, collect anonymized usage data from the VS Code extension, helping improve CodeQL's usability and performance. See [TELEMETRY.md](https://github.com/github/vscode-codeql/blob/main/extensions/ql-vscode/TELEMETRY.md) for more information on exactly what data is collected and what it is used for. [#611](https://github.com/github/vscode-codeql/pull/611)
+
+## 1.3.10 - 20 January 2021
+
+- Include the full stack in error log messages to help with debugging. [#726](https://github.com/github/vscode-codeql/pull/726)
+
+## 1.3.9 - 12 January 2021
+
+- No changes visible to end users.
+
+## 1.3.8 - 17 December 2020
+
+- Ensure databases are unlocked when removing them from the workspace. This will ensure that after a database is removed from VS Code, queries can be run on it from the command line without restarting the IDE. Requires CodeQL CLI 2.4.1 or later. [#681](https://github.com/github/vscode-codeql/pull/681)
+- Fix bug when removing databases where sometimes the source folder would not also be removed from the workspace or the database files would not be deleted from the workspace storage location. [#692](https://github.com/github/vscode-codeql/pull/692)
+- Query results with no string representation will now be displayed with placeholder text in query results. Previously, they were omitted. [#694](https://github.com/github/vscode-codeql/pull/694)
+- Add a label for the language of a database in the databases view. This will only take effect for new databases created with the CodeQL CLI v2.4.1 or later. [#697](https://github.com/github/vscode-codeql/pull/697)
+- Add clearer error message when running a query using a missing or invalid qlpack. [#702](https://github.com/github/vscode-codeql/pull/702)
+- Add clearer error message when trying to run a command from the query history view if no item in the history is selected. [#702](https://github.com/github/vscode-codeql/pull/702)
+- Fix a bug where it is not possible to download some database archives. This fix specifically addresses large archives and archives whose central directories do not align with file headers. [#700](https://github.com/github/vscode-codeql/pull/700)
+- Avoid error dialogs when QL test discovery or database cleanup encounters a missing directory. [#706](https://github.com/github/vscode-codeql/pull/706)
+- Add descriptive text and a link in the results view. [#711](https://github.com/github/vscode-codeql/pull/711)
+- Fix the _Set Label_ command in the query history view. [#710](https://github.com/github/vscode-codeql/pull/710)
+- Add the _CodeQL: View AST_ command to the right-click context menu when a source file in a database source archive is open in the editor. [#712](https://github.com/github/vscode-codeql/pull/712)
+
+## 1.3.7 - 24 November 2020
+
+- Editors opened by navigating from the results view are no longer opened in _preview mode_. Now they are opened as a persistent editor. [#630](https://github.com/github/vscode-codeql/pull/630)
+- When comparing the results of a failed QL test run and the `.expected` file does not exist, an empty `.expected` file is created and compared against the `.actual` file. [#669](https://github.com/github/vscode-codeql/pull/669)
+- Alter structure of the _Test Explorer_ tree. It now follows the structure of the filesystem instead of the QL Packs. [#624](https://github.com/github/vscode-codeql/pull/624)
+- Alter structure of the _Test Explorer_ tree. It now follows the structure of the filesystem instead of the QL Packs. [#624](https://github.com/github/vscode-codeql/pull/624)
+- Add more structured output for tests. [#626](https://github.com/github/vscode-codeql/pull/626)
+- Whenever the extension restarts, orphaned databases will be cleaned up. These are databases whose files are located inside of the extension's storage area, but are not imported into the workspace.
+- After renaming a database, the database list is re-sorted. [#685](https://github.com/github/vscode-codeql/pull/685)
+- Add a `codeQl.resultsDisplay.pageSize` setting to configure the number of results displayed in a single results view page. Increase the default page size from 100 to 200. [#686](https://github.com/github/vscode-codeql/pull/686)
+- Update the AST Viewer to include edge labels (if available) in addition to the target node labels. So far, only C/C++ databases take advantage of this change. [#688](https://github.com/github/vscode-codeql/pull/688)
+
+## 1.3.6 - 4 November 2020
+
+- Fix URI encoding for databases that were created with special characters in their paths. [#648](https://github.com/github/vscode-codeql/pull/648)
+- Disable CodeQL Test commands from the command palette [#667](https://github.com/github/vscode-codeql/pull/667)
+- Fix display of booleans in results view. [#657](https://github.com/github/vscode-codeql/pull/657)
+- Avoid recursive selection changes in AST Viewer. [#668](https://github.com/github/vscode-codeql/pull/668)
+
+## 1.3.5 - 27 October 2020
+
+- Fix a bug where archived source folders for databases were not showing any contents.
+- Fix URI encoding for databases that were created with special characters in their paths.
+
+## 1.3.4 - 22 October 2020
+
+- Add friendly welcome message when the databases view is empty.
+- Add open query, open results, and remove query commands in the query history view title bar.
+- The maximum number of simultaneous queries launchable by the `CodeQL: Run Queries in Selected Files` command is now configurable by changing the `codeQL.runningQueries.maxQueries` setting.
+- Allow simultaneously run queries to be canceled in a single-click.
+- Prevent multiple upgrade dialogs from appearing when running simultaneous queries on upgradeable databases.
+- Fix sorting of results. Some pages of results would have the wrong sort order and columns.
+- Remember previous sort order when reloading query results.
+- Fix proper escaping of backslashes in SARIF message strings.
+- Allow setting `codeQL.runningQueries.numberOfThreads` and `codeQL.runningTests.numberOfThreads` to 0, (which is interpreted as 'use one thread per core on the machine').
+- Clear the problems view of all CodeQL query results when a database is removed.
+- Add a `View DIL` command on query history items. This opens a text editor containing the Datalog Intermediary Language representation of the compiled query.
+- Remove feature flag for the AST Viewer. For more information on how to use the AST Viewer, [see the documentation](https://help.semmle.com/codeql/codeql-for-vscode/procedures/exploring-the-structure-of-your-source-code.html).
+- The `codeQL.runningTests.numberOfThreads` setting is now used correctly when running tests.
+- Alter structure of the _Test Explorer_ tree. It now follows the structure of the filesystem instead of the qlpacks.
+- Ensure output of CodeQL test runs includes compilation error messages and test failure messages.
+
 ## 1.3.3 - 16 September 2020
 
 - Fix display of raw results entities with label but no url.

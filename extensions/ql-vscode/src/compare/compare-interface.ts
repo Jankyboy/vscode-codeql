@@ -1,4 +1,4 @@
-import { DisposableObject } from '../vscode-utils/disposable-object';
+import { DisposableObject } from '../pure/disposable-object';
 import {
   WebviewPanel,
   ExtensionContext,
@@ -14,13 +14,12 @@ import {
   FromCompareViewMessage,
   ToCompareViewMessage,
   QueryCompareResult,
-} from '../interface-types';
+} from '../pure/interface-types';
 import { Logger } from '../logging';
 import { CodeQLCliServer } from '../cli';
 import { DatabaseManager } from '../databases';
 import { getHtmlForWebview, jumpToLocation } from '../interface-utils';
-import { adaptSchema, adaptBqrs, RawResultSet } from '../adapt';
-import { BQRSInfo } from '../bqrs-cli-types';
+import { transformBqrsResultSet, RawResultSet, BQRSInfo } from '../pure/bqrs-cli-types';
 import resultsDiff from './resultsDiff';
 
 interface ComparePair {
@@ -257,8 +256,7 @@ export class CompareInterfaceManager extends DisposableObject {
       resultsPath,
       resultSetName
     );
-    const adaptedSchema = adaptSchema(schema);
-    return adaptBqrs(adaptedSchema, chunk);
+    return transformBqrsResultSet(schema, chunk);
   }
 
   private compareResults(

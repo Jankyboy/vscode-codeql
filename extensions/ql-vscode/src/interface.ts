@@ -1,6 +1,6 @@
 import * as path from 'path';
 import * as Sarif from 'sarif';
-import { DisposableObject } from './vscode-utils/disposable-object';
+import { DisposableObject } from './pure/disposable-object';
 import * as vscode from 'vscode';
 import {
   Diagnostic,
@@ -13,9 +13,9 @@ import {
 } from 'vscode';
 import * as cli from './cli';
 import { CodeQLCliServer } from './cli';
-import { DatabaseItem, DatabaseManager } from './databases';
+import { DatabaseEventKind, DatabaseItem, DatabaseManager } from './databases';
 import { showAndLogErrorMessage } from './helpers';
-import { assertNever } from './helpers-pure';
+import { assertNever } from './pure/helpers-pure';
 import {
   FromResultsViewMsg,
   Interpretation,
@@ -26,22 +26,15 @@ import {
   SortedResultsMap,
   InterpretedResultsSortState,
   SortDirection,
-  RAW_RESULTS_PAGE_SIZE,
-  INTERPRETED_RESULTS_PAGE_SIZE,
   ALERTS_TABLE_NAME,
   RawResultsSortState,
-} from './interface-types';
+} from './pure/interface-types';
 import { Logger } from './logging';
-import * as messages from './messages';
+import * as messages from './pure/messages';
+import { commandRunner } from './commandRunner';
 import { CompletedQuery, interpretResults } from './query-results';
 import { QueryInfo, tmpDir } from './run-queries';
-import { parseSarifLocation, parseSarifPlainTextMessage } from './sarif-utils';
-import {
-  adaptSchema,
-  adaptBqrs,
-  ParsedResultSets,
-  RawResultSet,
-} from './adapt';
+import { parseSarifLocation, parseSarifPlainTextMessage } from './pure/sarif-utils';
 import {
   WebviewReveal,
   fileUriToWebviewUri,
@@ -51,8 +44,9 @@ import {
   shownLocationLineDecoration,
   jumpToLocation,
 } from './interface-utils';
-import { getDefaultResultSetName } from './interface-types';
-import { ResultSetSchema } from './bqrs-cli-types';
+import { getDefaultResultSetName, ParsedResultSets } from './pure/interface-types';
+import { RawResultSet, transformBqrsResultSet, ResultSetSchema } from './pure/bqrs-cli-types';
+import { PAGE_SIZE } from './config';
 
 /**
  * interface.ts
@@ -94,11 +88,11 @@ function sortInterpretedResults(
 }
 
 function numPagesOfResultSet(resultSet: RawResultSet): number {
-  return Math.ceil(resultSet.schema.tupleCount / RAW_RESULTS_PAGE_SIZE);
+  return Math.ceil(resultSet.schema.rows / PAGE_SIZE.getValue<number>());
 }
 
 function numInterpretedPages(interpretation: Interpretation | undefined): number {
-  return Math.ceil((interpretation?.sarif.runs[0].results?.length || 0) / INTERPRETED_RESULTS_PAGE_SIZE);
+  return Math.ceil((interpretation?.sarif.runs[0].results?.length || 0) / PAGE_SIZE.getValue<number>());
 }
 
 export class InterfaceManager extends DisposableObject {
@@ -127,20 +121,31 @@ export class InterfaceManager extends DisposableObject {
     );
     logger.log('Registering path-step navigation commands.');
     this.push(
-      vscode.commands.registerCommand(
+      commandRunner(
         'codeQLQueryResults.nextPathStep',
         this.navigatePathStep.bind(this, 1)
       )
     );
     this.push(
-      vscode.commands.registerCommand(
+      commandRunner(
         'codeQLQueryResults.previousPathStep',
         this.navigatePathStep.bind(this, -1)
       )
     );
+
+    this.push(
+      this.databaseManager.onDidChangeDatabaseItem(({ kind }) => {
+        if (kind === DatabaseEventKind.Remove) {
+          this._diagnosticCollection.clear();
+          this.postMessage({
+            t: 'untoggleShowProblems'
+          });
+        }
+      })
+    );
   }
 
-  navigatePathStep(direction: number): void {
+  async navigatePathStep(direction: number): Promise<void> {
     this.postMessage({ t: 'navigatePath', direction });
   }
 
@@ -231,58 +236,67 @@ export class InterfaceManager extends DisposableObject {
   }
 
   private async handleMsgFromView(msg: FromResultsViewMsg): Promise<void> {
-    switch (msg.t) {
-      case 'viewSourceFile': {
-        await jumpToLocation(msg, this.databaseManager, this.logger);
-        break;
-      }
-      case 'toggleDiagnostics': {
-        if (msg.visible) {
-          const databaseItem = this.databaseManager.findDatabaseItem(
-            Uri.parse(msg.databaseUri)
-          );
-          if (databaseItem !== undefined) {
-            await this.showResultsAsDiagnostics(
-              msg.origResultsPaths,
-              msg.metadata,
-              databaseItem
+    try {
+      switch (msg.t) {
+        case 'viewSourceFile': {
+          await jumpToLocation(msg, this.databaseManager, this.logger);
+          break;
+        }
+        case 'toggleDiagnostics': {
+          if (msg.visible) {
+            const databaseItem = this.databaseManager.findDatabaseItem(
+              Uri.parse(msg.databaseUri)
+            );
+            if (databaseItem !== undefined) {
+              await this.showResultsAsDiagnostics(
+                msg.origResultsPaths,
+                msg.metadata,
+                databaseItem
+              );
+            }
+          } else {
+            // TODO: Only clear diagnostics on the same database.
+            this._diagnosticCollection.clear();
+          }
+          break;
+        }
+        case 'resultViewLoaded':
+          this._panelLoaded = true;
+          this._panelLoadedCallBacks.forEach((cb) => cb());
+          this._panelLoadedCallBacks = [];
+          break;
+        case 'changeSort':
+          await this.changeRawSortState(msg.resultSetName, msg.sortState);
+          break;
+        case 'changeInterpretedSort':
+          await this.changeInterpretedSortState(msg.sortState);
+          break;
+        case 'changePage':
+          if (msg.selectedTable === ALERTS_TABLE_NAME) {
+            await this.showPageOfInterpretedResults(msg.pageNumber);
+          }
+          else {
+            await this.showPageOfRawResults(
+              msg.selectedTable,
+              msg.pageNumber,
+              // When we are in an unsorted state, we guarantee that
+              // sortedResultsInfo doesn't have an entry for the current
+              // result set. Use this to determine whether or not we use
+              // the sorted bqrs file.
+              this._displayedQuery?.sortedResultsInfo.has(msg.selectedTable) || false
             );
           }
-        } else {
-          // TODO: Only clear diagnostics on the same database.
-          this._diagnosticCollection.clear();
-        }
-        break;
+          break;
+        case 'openFile':
+          await this.openFile(msg.filePath);
+          break;
+        default:
+          assertNever(msg);
       }
-      case 'resultViewLoaded':
-        this._panelLoaded = true;
-        this._panelLoadedCallBacks.forEach((cb) => cb());
-        this._panelLoadedCallBacks = [];
-        break;
-      case 'changeSort':
-        await this.changeRawSortState(msg.resultSetName, msg.sortState);
-        break;
-      case 'changeInterpretedSort':
-        await this.changeInterpretedSortState(msg.sortState);
-        break;
-      case 'changePage':
-        if (msg.selectedTable === ALERTS_TABLE_NAME) {
-          await this.showPageOfInterpretedResults(msg.pageNumber);
-        }
-        else {
-          await this.showPageOfRawResults(
-            msg.selectedTable,
-            msg.pageNumber,
-            // When we are in an unsorted state, we guarantee that
-            // sortedResultsInfo doesn't have an entry for the current
-            // result set. Use this to determine whether or not we use
-            // the sorted bqrs file.
-            this._displayedQuery?.sortedResultsInfo.has(msg.selectedTable) || false
-          );
-        }
-        break;
-      default:
-        assertNever(msg);
+    } catch (e) {
+      showAndLogErrorMessage(e.message, {
+        fullMessage: e.stack
+      });
     }
   }
 
@@ -358,36 +372,42 @@ export class InterfaceManager extends DisposableObject {
       });
     }
 
-    const getParsedResultSets = async (): Promise<ParsedResultSets> => {
+    // Note that the resultSetSchemas will return offsets for the default (unsorted) page,
+    // which may not be correct. However, in this case, it doesn't matter since we only
+    // need the first offset, which will be the same no matter which sorting we use.
+    const resultSetSchemas = await this.getResultSetSchemas(results);
+    const resultSetNames = resultSetSchemas.map(schema => schema.name);
 
-      const resultSetSchemas = await this.getResultSetSchemas(results);
-      const resultSetNames = resultSetSchemas.map(schema => schema.name);
+    const selectedTable = getDefaultResultSetName(resultSetNames);
+    const schema = resultSetSchemas.find(
+      (resultSet) => resultSet.name == selectedTable
+    )!;
 
-      // This may not wind up being the page we actually show, if there are interpreted results,
-      // but speculatively send it anyway.
-      const selectedTable = getDefaultResultSetName(resultSetNames);
-      const schema = resultSetSchemas.find(
-        (resultSet) => resultSet.name == selectedTable
-      )!;
-
-      const chunk = await this.cliServer.bqrsDecode(
-        results.query.resultsPaths.resultsPath,
-        schema.name,
-        {
-          offset: schema.pagination?.offsets[0],
-          pageSize: RAW_RESULTS_PAGE_SIZE
-        }
-      );
-      const adaptedSchema = adaptSchema(schema);
-      const resultSet = adaptBqrs(adaptedSchema, chunk);
-      return {
-        pageNumber: 0,
-        numPages: numPagesOfResultSet(resultSet),
-        numInterpretedPages: numInterpretedPages(this._interpretation),
-        resultSet: { t: 'RawResultSet', ...resultSet },
-        selectedTable: undefined,
-        resultSetNames,
-      };
+    // Use sorted results path if it exists. This may happen if we are
+    // reloading the results view after it has been sorted in the past.
+    const resultsPath = results.getResultsPath(selectedTable);
+    const pageSize = PAGE_SIZE.getValue<number>();
+    const chunk = await this.cliServer.bqrsDecode(
+      resultsPath,
+      schema.name,
+      {
+        // Always send the first page.
+        // It may not wind up being the page we actually show,
+        // if there are interpreted results, but speculatively
+        // send anyway.
+        offset: schema.pagination?.offsets[0],
+        pageSize
+      }
+    );
+    const resultSet = transformBqrsResultSet(schema, chunk);
+    const parsedResultSets: ParsedResultSets = {
+      pageNumber: 0,
+      pageSize,
+      numPages: numPagesOfResultSet(resultSet),
+      numInterpretedPages: numInterpretedPages(this._interpretation),
+      resultSet: { ...resultSet, t: 'RawResultSet' },
+      selectedTable: undefined,
+      resultSetNames,
     };
 
     await this.postMessage({
@@ -397,11 +417,13 @@ export class InterfaceManager extends DisposableObject {
       resultsPath: this.convertPathToWebviewUri(
         results.query.resultsPaths.resultsPath
       ),
-      parsedResultSets: await getParsedResultSets(),
+      parsedResultSets,
       sortedResultsMap,
       database: results.database,
       shouldKeepOldResultsWhileRendering,
       metadata: results.query.metadata,
+      queryName: results.toString(),
+      queryPath: results.query.program.queryPath
     });
   }
 
@@ -431,16 +453,25 @@ export class InterfaceManager extends DisposableObject {
       metadata: this._displayedQuery.query.metadata,
       pageNumber,
       resultSetNames,
+      pageSize: PAGE_SIZE.getValue(),
       numPages: numInterpretedPages(this._interpretation),
+      queryName: this._displayedQuery.toString(),
+      queryPath: this._displayedQuery.query.program.queryPath
     });
   }
 
-  private async getResultSetSchemas(results: CompletedQuery): Promise<ResultSetSchema[]> {
+  private async getResultSetSchemas(results: CompletedQuery, selectedTable = ''): Promise<ResultSetSchema[]> {
+    const resultsPath = results.getResultsPath(selectedTable);
     const schemas = await this.cliServer.bqrsInfo(
-      results.query.resultsPaths.resultsPath,
-      RAW_RESULTS_PAGE_SIZE
+      resultsPath,
+      PAGE_SIZE.getValue()
     );
     return schemas['result-sets'];
+  }
+
+  public async openFile(filePath: string) {
+    const textDocument = await vscode.workspace.openTextDocument(filePath);
+    await vscode.window.showTextDocument(textDocument, vscode.ViewColumn.One);
   }
 
   /**
@@ -462,7 +493,7 @@ export class InterfaceManager extends DisposableObject {
         (sortedResultsMap[k] = this.convertPathPropertiesToWebviewUris(v))
     );
 
-    const resultSetSchemas = await this.getResultSetSchemas(results);
+    const resultSetSchemas = await this.getResultSetSchemas(results, sorted ? selectedTable : '');
     const resultSetNames = resultSetSchemas.map(schema => schema.name);
 
     const schema = resultSetSchemas.find(
@@ -471,32 +502,20 @@ export class InterfaceManager extends DisposableObject {
     if (schema === undefined)
       throw new Error(`Query result set '${selectedTable}' not found.`);
 
-    const getResultsPath = () => {
-      if (sorted) {
-        const resultsPath = results.sortedResultsInfo.get(selectedTable)?.resultsPath;
-        if (resultsPath === undefined) {
-          throw new Error(`Can't find sorted results for table ${selectedTable}`);
-        }
-        return resultsPath;
-      }
-      else {
-        return results.query.resultsPaths.resultsPath;
-      }
-    };
-
+    const pageSize = PAGE_SIZE.getValue<number>();
     const chunk = await this.cliServer.bqrsDecode(
-      getResultsPath(),
+      results.getResultsPath(selectedTable, sorted),
       schema.name,
       {
         offset: schema.pagination?.offsets[pageNumber],
-        pageSize: RAW_RESULTS_PAGE_SIZE
+        pageSize
       }
     );
-    const adaptedSchema = adaptSchema(schema);
-    const resultSet = adaptBqrs(adaptedSchema, chunk);
+    const resultSet = transformBqrsResultSet(schema, chunk);
 
     const parsedResultSets: ParsedResultSets = {
       pageNumber,
+      pageSize,
       resultSet: { t: 'RawResultSet', ...resultSet },
       numPages: numPagesOfResultSet(resultSet),
       numInterpretedPages: numInterpretedPages(this._interpretation),
@@ -516,6 +535,8 @@ export class InterfaceManager extends DisposableObject {
       database: results.database,
       shouldKeepOldResultsWhileRendering: false,
       metadata: results.query.metadata,
+      queryName: results.toString(),
+      queryPath: results.query.program.queryPath
     });
   }
 
@@ -533,8 +554,9 @@ export class InterfaceManager extends DisposableObject {
       sourceInfo
     );
     sarif.runs.forEach(run => {
-      if (run.results !== undefined)
+      if (run.results !== undefined) {
         sortInterpretedResults(run.results, sortState);
+      }
     });
 
     const numTotalResults = (() => {
@@ -561,8 +583,8 @@ export class InterfaceManager extends DisposableObject {
     function getPageOfRun(run: Sarif.Run): Sarif.Run {
       return {
         ...run, results: run.results?.slice(
-          INTERPRETED_RESULTS_PAGE_SIZE * pageNumber,
-          INTERPRETED_RESULTS_PAGE_SIZE * (pageNumber + 1)
+          PAGE_SIZE.getValue<number>() * pageNumber,
+          PAGE_SIZE.getValue<number>() * (pageNumber + 1)
         )
       };
     }
@@ -610,7 +632,7 @@ export class InterfaceManager extends DisposableObject {
       } catch (e) {
         // If interpretation fails, accept the error and continue
         // trying to render uninterpreted results anyway.
-        this.logger.log(
+        showAndLogErrorMessage(
           `Exception during results interpretation: ${e.message}. Will show raw results instead.`
         );
       }
@@ -684,7 +706,7 @@ export class InterfaceManager extends DisposableObject {
         result.locations[0],
         sourceLocationPrefix
       );
-      if (sarifLoc.t == 'NoLocation') {
+      if ('hint' in sarifLoc) {
         continue;
       }
       const resultLocation = tryResolveLocation(sarifLoc, databaseItem);
@@ -709,7 +731,7 @@ export class InterfaceManager extends DisposableObject {
             relatedLocationsById[section.dest],
             sourceLocationPrefix
           );
-          if (sarifChunkLoc.t == 'NoLocation') {
+          if ('hint' in sarifChunkLoc) {
             continue;
           }
           const referenceLocation = tryResolveLocation(

@@ -1,5 +1,10 @@
 name: Build Extension
-on: [push, pull_request]
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches:
+      - main
 
 jobs:
   build:
@@ -16,17 +21,19 @@ jobs:
 
       - uses: actions/setup-node@v1
         with:
-          node-version: '10.18.1'
+          node-version: '14.14.0'
 
       - name: Install dependencies
+        working-directory: extensions/ql-vscode
         run: |
-          cd extensions/ql-vscode
           npm install
         shell: bash
 
       - name: Build
+        working-directory: extensions/ql-vscode
+        env:
+          APP_INSIGHTS_KEY: '${{ secrets.APP_INSIGHTS_KEY }}'
         run: |
-          cd extensions/ql-vscode
           npm run build
         shell: bash
 
@@ -57,24 +64,25 @@ jobs:
 
       - uses: actions/setup-node@v1
         with:
-          node-version: '10.18.1'
+          node-version: '14.14.0'
 
-      # We have to build the dependencies in `lib` before running any tests.
       - name: Install dependencies
+        working-directory: extensions/ql-vscode
         run: |
-          cd extensions/ql-vscode
           npm install
         shell: bash
 
       - name: Build
+        working-directory: extensions/ql-vscode
+        env:
+          APP_INSIGHTS_KEY: '${{ secrets.APP_INSIGHTS_KEY }}'
         run: |
-          cd extensions/ql-vscode
           npm run build
         shell: bash
 
       - name: Lint
+        working-directory: extensions/ql-vscode
         run: |
-          cd extensions/ql-vscode
           npm run lint
 
       - name: Install CodeQL
@@ -87,27 +95,76 @@ jobs:
         shell: bash
 
       - name: Run unit tests (Linux)
+        working-directory: extensions/ql-vscode
         if: matrix.os == 'ubuntu-latest'
         run: |
-          cd extensions/ql-vscode
           CODEQL_PATH=$GITHUB_WORKSPACE/codeql-home/codeql/codeql npm run test
 
       - name: Run unit tests (Windows)
         if: matrix.os == 'windows-latest'
+        working-directory: extensions/ql-vscode
         run: |
-          cd extensions/ql-vscode
           $env:CODEQL_PATH=$(Join-Path $env:GITHUB_WORKSPACE -ChildPath 'codeql-home/codeql/codeql.exe')
           npm run test
 
       - name: Run integration tests (Linux)
         if: matrix.os == 'ubuntu-latest'
+        working-directory: extensions/ql-vscode
         run: |
-          cd extensions/ql-vscode
           sudo apt-get install xvfb
           /usr/bin/xvfb-run npm run integration
 
       - name: Run integration tests (Windows)
         if: matrix.os == 'windows-latest'
+        working-directory: extensions/ql-vscode
         run: |
-          cd extensions/ql-vscode
           npm run integration
+
+  cli-test:
+    name: CLI Test
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        version: ['v2.2.6', 'v2.3.3', 'v2.4.4']
+    env:
+      CLI_VERSION: ${{ matrix.version }}
+      TEST_CODEQL_PATH: '${{ github.workspace }}/codeql'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2
+
+      - uses: actions/setup-node@v1
+        with:
+          node-version: '14.14.0'
+
+      - name: Install dependencies
+        working-directory: extensions/ql-vscode
+        run: |
+          npm install
+        shell: bash
+
+      - name: Build
+        working-directory: extensions/ql-vscode
+        run: |
+          npm run build
+        shell: bash
+
+      - name: Checkout QL
+        uses: actions/checkout@v2
+        with:
+          repository: github/codeql
+          path: codeql
+
+      - name: Run CLI tests (Linux)
+        working-directory: extensions/ql-vscode
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          /usr/bin/xvfb-run npm run cli-integration
+
+      - name: Run CLI tests (Windows)
+        working-directory: extensions/ql-vscode
+        if: matrix.os == 'windows-latest'
+        run: |
+          npm run cli-integration
