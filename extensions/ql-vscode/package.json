@@ -676,7 +676,7 @@
     "@types/fs-extra": "^8.0.0",
     "@types/glob": "^7.1.1",
     "@types/google-protobuf": "^3.2.7",
-    "@types/gulp": "^4.0.6",
+    "@types/gulp": "^4.0.7",
     "@types/gulp-sourcemaps": "0.0.32",
     "@types/js-yaml": "~3.12.2",
     "@types/jszip": "~3.1.6",
